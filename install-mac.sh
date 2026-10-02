@@ -56,8 +56,8 @@ SSH_OPTS=(-o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new)
 can_login() { ssh -i "$KEY" -o BatchMode=yes -o IdentitiesOnly=yes "${SSH_OPTS[@]}" "$@" true 2>/dev/null; }
 install_key() { # install_key <label> <ssh args...>
   local label="$1"; shift
-  if can_login "$@"; then ok "$label: ключ уже установлен"; return 0; fi
-  echo "    Введите пароль от сервера «$label» (символы не отображаются):"
+  if can_login "$@"; then ok "${label} — ключ уже установлен"; return 0; fi
+  echo "    Введите пароль от сервера «${label}» (символы не отображаются):"
   ssh "${SSH_OPTS[@]}" -o PubkeyAuthentication=no "$@" \
     "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" \
     < "$KEY.pub" && can_login "$@"
@@ -80,10 +80,10 @@ fi
 say "5/7  Проекты в $CODE"
 mkdir -p "$CODE"
 for repo in poymai poymaitelegram poymai-deploy; do
-  if [[ -d "$CODE/$repo/.git" ]]; then
-    git -C "$CODE/$repo" pull --ff-only -q 2>/dev/null && ok "$repo обновлён" || ok "$repo уже есть (есть локальные правки — не трогаю)"
+  if [[ -d "${CODE}/${repo}/.git" ]]; then
+    git -C "${CODE}/${repo}" pull --ff-only -q 2>/dev/null && ok "${repo} обновлён" || ok "${repo} уже есть (есть локальные правки — не трогаю)"
   else
-    gh repo clone "Lonkbot228/$repo" "$CODE/$repo" -- -q 2>/dev/null && ok "$repo скачан" || echo "    ! не удалось скачать $repo (проверьте, что репозиторий существует)"
+    gh repo clone "Lonkbot228/$repo" "${CODE}/${repo}" -- -q 2>/dev/null && ok "${repo} скачан" || echo "    ! не удалось скачать ${repo} (проверьте, что репозиторий существует)"
   fi
 done
 [[ -d "$CODE/poymai-deploy/.git" ]] || die "Нет репозитория poymai-deploy на GitHub"
