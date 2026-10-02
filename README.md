@@ -11,8 +11,7 @@
 
 ## Установка
 - Windows: `src-tauri/target/release/bundle/nsis/Poymai Deploy_*_x64-setup.exe`
-- Mac: на маке `npm ci && npx tauri build` → `src-tauri/target/release/bundle/dmg/*.dmg`
-  (или GitHub Actions → Build installers).
+- Mac: см. [MAC_SETUP.md](MAC_SETUP.md) — 4 команды, всё остальное делает `install-mac.sh`.
 
 На каждом компьютере нужен SSH-ключ `~/.ssh/id_ed25519_poymai`, добавленный
 на `poymai@192.168.3.209` и `root@192.168.3.99`.
