@@ -79,11 +79,12 @@ fi
 
 say "5/7  Проекты в $CODE"
 mkdir -p "$CODE"
-for repo in poymai poymaitelegram poymai-deploy; do
+for pair in "poymai:poymai" "poymai_lock:poymaitelegram" "poymai-deploy:poymai-deploy"; do
+  gh_name="${pair%%:*}"; repo="${pair##*:}"
   if [[ -d "${CODE}/${repo}/.git" ]]; then
     git -C "${CODE}/${repo}" pull --ff-only -q 2>/dev/null && ok "${repo} обновлён" || ok "${repo} уже есть (есть локальные правки — не трогаю)"
   else
-    gh repo clone "Lonkbot228/$repo" "${CODE}/${repo}" -- -q 2>/dev/null && ok "${repo} скачан" || echo "    ! не удалось скачать ${repo} (проверьте, что репозиторий существует)"
+    gh repo clone "Lonkbot228/${gh_name}" "${CODE}/${repo}" -- -q 2>/dev/null && ok "${repo} скачан" || echo "    ! не удалось скачать ${repo} (репозиторий Lonkbot228/${gh_name})"
   fi
 done
 [[ -d "$CODE/poymai-deploy/.git" ]] || die "Нет репозитория poymai-deploy на GitHub"
