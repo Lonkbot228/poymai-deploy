@@ -107,6 +107,10 @@ async fn run_check(repo: &Path, line: &str) -> Result<proc::Out> {
     }
 }
 
+fn commit_message(opts: &DeployOptions) -> Option<String> {
+    opts.message.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(str::to_string)
+}
+
 /// Commits local work (if any), rebases onto GitHub and pushes. Returns the commit to deploy.
 async fn publish<F: Fn(Event) + Send + Sync>(ctx: &Ctx<'_, F>, repo: &Path, opts: &DeployOptions) -> Result<String> {
     let p = ctx.profile;
@@ -117,6 +121,14 @@ async fn publish<F: Fn(Event) + Send + Sync>(ctx: &Ctx<'_, F>, repo: &Path, opts
     }
     if Path::new(repo).join(".git").join("rebase-merge").exists() || repo.join(".git").join("MERGE_HEAD").exists() {
         bail!("В репозитории незавершённый merge/rebase — завершите его вручную.");
+    }
+    if !state.changes.is_empty() && commit_message(opts).is_none() {
+        // A message made up from folder names says nothing about the change
+        // and used to land in history unseen; the user confirms the text.
+        bail!(
+            "Нет сообщения коммита. Предлагаемое: «{}». Подтвердите его в поле «Что изменилось?» или передайте -m.",
+            state.suggested_message
+        );
     }
     git(repo, &["fetch", "-q", "origin", "--prune"]).await
         .map_err(|e| anyhow!("Не удалось связаться с GitHub: {e}"))?;
@@ -140,11 +152,7 @@ async fn publish<F: Fn(Event) + Send + Sync>(ctx: &Ctx<'_, F>, repo: &Path, opts
         ctx.log("Нет незакоммиченных изменений");
     } else {
         git::check_secrets(repo, &state.changes)?;
-        let message = opts
-            .message
-            .clone()
-            .filter(|m| !m.trim().is_empty())
-            .unwrap_or_else(|| git::auto_message(&state.changes));
+        let message = commit_message(opts).ok_or_else(|| anyhow!("Нет сообщения коммита"))?;
         git(repo, &["add", "-A"]).await?;
         let trailer = format!("Deployed-from: {}", machine_name());
         git(repo, &["commit", "-q", "-m", message.trim(), "-m", &trailer]).await?;

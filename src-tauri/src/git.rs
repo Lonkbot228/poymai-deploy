@@ -24,6 +24,9 @@ pub struct LocalState {
     pub ahead: u32,
     pub behind: u32,
     pub changes: Vec<ChangedFile>,
+    /// A commit message built from the changed paths, offered to the user
+    /// for confirmation; never committed without them seeing it.
+    pub suggested_message: String,
 }
 
 pub async fn local_state(repo: &Path, branch: &str) -> Result<LocalState> {
@@ -44,6 +47,8 @@ pub async fn local_state(repo: &Path, branch: &str) -> Result<LocalState> {
             ahead = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
         }
     }
+    let changes = changes(repo).await?;
+    let suggested_message = if changes.is_empty() { String::new() } else { auto_message(&changes) };
     Ok(LocalState {
         branch: cur,
         head,
@@ -51,20 +56,42 @@ pub async fn local_state(repo: &Path, branch: &str) -> Result<LocalState> {
         upstream,
         ahead,
         behind,
-        changes: changes(repo).await?,
+        changes,
+        suggested_message,
     })
 }
 
 pub async fn changes(repo: &Path) -> Result<Vec<ChangedFile>> {
-    let out = git(repo, &["status", "--porcelain=v1", "--untracked-files=all"]).await?;
-    Ok(out
-        .lines()
-        .filter(|l| l.len() > 3)
-        .map(|l| ChangedFile {
-            status: l[..2].trim().to_string(),
-            path: l[3..].trim_matches('"').to_string(),
-        })
-        .collect())
+    // `run`, not `git`/`run_ok`: those trim stdout, and the first entry of
+    // " M app/x.py" starts with a space that belongs to the status column.
+    let out = run("git", &["status", "--porcelain=v1", "-z", "--untracked-files=all"], Some(repo)).await?;
+    if !out.ok() {
+        bail!("git status: {}", out.text());
+    }
+    Ok(parse_porcelain_z(&out.stdout))
+}
+
+/// Parses `git status --porcelain=v1 -z`: `XY path\0`, where a rename or copy
+/// is followed by one more `\0`-terminated field with the original path.
+/// With `-z` paths are never quoted, so names with spaces or non-ASCII
+/// characters come through as they are.
+pub fn parse_porcelain_z(out: &str) -> Vec<ChangedFile> {
+    let mut files = vec![];
+    let mut fields = out.split('\0');
+    while let Some(entry) = fields.next() {
+        if entry.len() < 4 || !entry.is_char_boundary(2) || !entry.is_char_boundary(3) {
+            continue;
+        }
+        let status = &entry[..2];
+        if status.contains('R') || status.contains('C') {
+            fields.next();
+        }
+        files.push(ChangedFile {
+            status: status.trim().to_string(),
+            path: entry[3..].to_string(),
+        });
+    }
+    files
 }
 
 /// Remote branch heads without fetching objects: (main, production).
@@ -117,6 +144,7 @@ pub fn check_secrets(repo: &Path, files: &[ChangedFile]) -> Result<()> {
     Ok(())
 }
 
+/// "Update app, frontend/src/app (8 files)": the areas the change touches.
 pub fn auto_message(files: &[ChangedFile]) -> String {
     let mut areas: Vec<String> = vec![];
     for f in files {
@@ -129,4 +157,52 @@ pub fn auto_message(files: &[ChangedFile]) -> String {
     let shown = areas.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
     let more = if areas.len() > 4 { format!(" +{}", areas.len() - 4) } else { String::new() };
     format!("Update {shown}{more} ({} files)", files.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(status: &str, path: &str) -> ChangedFile {
+        ChangedFile { status: status.into(), path: path.into() }
+    }
+
+    #[test]
+    fn first_entry_keeps_its_leading_status_space() {
+        let files = parse_porcelain_z(" M app/x.py\0 M frontend/src/app/page.tsx\0?? tests/new.py\0");
+        let paths: Vec<_> = files.iter().map(|f| (f.status.as_str(), f.path.as_str())).collect();
+        assert_eq!(
+            paths,
+            vec![("M", "app/x.py"), ("M", "frontend/src/app/page.tsx"), ("??", "tests/new.py")]
+        );
+    }
+
+    #[test]
+    fn renames_skip_the_original_path_field() {
+        let files = parse_porcelain_z("R  docs/new.md\0old.md\0 M app/x.py\0");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].status, "R");
+        assert_eq!(files[0].path, "docs/new.md");
+        assert_eq!(files[1].path, "app/x.py");
+    }
+
+    #[test]
+    fn spaces_and_cyrillic_are_not_quoted_or_cut() {
+        let files = parse_porcelain_z("?? docs/план работ.md\0");
+        assert_eq!(files[0].path, "docs/план работ.md");
+    }
+
+    #[test]
+    fn a_modified_root_env_is_still_caught_as_a_secret() {
+        let files = parse_porcelain_z(" M .env\0");
+        assert_eq!(files[0].path, ".env");
+        let err = check_secrets(Path::new("/nonexistent"), &files).unwrap_err().to_string();
+        assert!(err.contains("секрет: .env"), "{err}");
+    }
+
+    #[test]
+    fn auto_message_names_the_areas_correctly() {
+        let files = vec![file("M", "app/server.py"), file("M", "app/auth.py"), file("M", "frontend/src/app/page.tsx")];
+        assert_eq!(auto_message(&files), "Update app, frontend/src/app (3 files)");
+    }
 }
