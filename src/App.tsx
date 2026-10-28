@@ -203,6 +203,9 @@ function DeployCard({ status, busy, onDeploy }: { status?: ProfileStatus; busy: 
   const [backup, setBackup] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
   const changes = status?.local?.changes ?? [];
+  const suggested = status?.local?.suggested_message ?? "";
+  // Local changes are committed only with a message the user has seen.
+  const needsMessage = changes.length > 0 && !message.trim();
   const blocked = !status?.local || status.incoming > 0 && status.overlap.length > 0;
   return (
     <section className="card">
@@ -222,16 +225,22 @@ function DeployCard({ status, busy, onDeploy }: { status?: ProfileStatus; busy: 
         </ul>
       )}
       <textarea
-        placeholder={changes.length ? "Что изменилось? (пусто — сообщение сгенерируется)" : "Нет новых изменений — будет передеплоен текущий коммит"}
+        placeholder={changes.length ? "Что изменилось?" : "Нет новых изменений — будет передеплоен текущий коммит"}
         value={message}
         onChange={(e) => setMessage(e.target.value)}
         rows={2}
       />
+      {needsMessage && suggested && (
+        <p className="muted tiny">
+          Предлагаемое сообщение: «{suggested}»{" "}
+          <button className="link-btn" onClick={() => setMessage(suggested)}>Подставить</button>
+        </p>
+      )}
       <div className="row opts">
         <label><input type="checkbox" checked={dry} onChange={(e) => setDry(e.target.checked)} /> Только проверить</label>
         <label><input type="checkbox" checked={backup} onChange={(e) => setBackup(e.target.checked)} /> Бэкап БД</label>
       </div>
-      <button className="primary" disabled={busy || blocked}
+      <button className="primary" disabled={busy || blocked || needsMessage}
         onClick={() => onDeploy({ message, dry_run: dry, backup_db: backup })}>
         {busy ? "Деплой идёт…" : dry ? "Проверить" : "Задеплоить"}
       </button>

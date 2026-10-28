@@ -22,6 +22,8 @@ export type LocalState = {
   ahead: number;
   behind: number;
   changes: ChangedFile[];
+  /** Built from the changed paths; the user confirms or edits it before committing. */
+  suggested_message: string;
 };
 export type ProfileStatus = {
   id: string;
