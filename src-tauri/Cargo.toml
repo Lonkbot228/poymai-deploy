@@ -1,6 +1,6 @@
 [package]
 name = "poymai-deploy"
-version = "3.0.0"
+version = "3.1.0"
 description = "Poymai Deploy — git-based deploys for PoymAI"
 edition = "2021"
 

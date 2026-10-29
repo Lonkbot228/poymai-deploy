@@ -39,6 +39,7 @@ pub struct Outcome {
     pub status: String,
     pub text: String,
     pub code: i32,
+    pub seconds: u64,
 }
 
 pub const STEPS: &[(&str, u8, &str)] = &[
@@ -187,10 +188,30 @@ async fn publish<F: Fn(Event) + Send + Sync>(ctx: &Ctx<'_, F>, repo: &Path, opts
     Ok(sha)
 }
 
+/// For scheduled deploys: commit and push now, so the job later installs exactly this commit.
+pub async fn publish_only<F: Fn(Event) + Send + Sync>(profile: &Profile, opts: DeployOptions, emit: &F) -> Result<String> {
+    let ctx = Ctx { profile, emit, progress: AtomicU8::new(0) };
+    let repo = PathBuf::from(&profile.repo_path);
+    let result = match &opts.sha {
+        Some(sha) => git(&repo, &["rev-parse", &format!("{sha}^{{commit}}")]).await
+            .map_err(|_| anyhow!("Коммит {sha} не найден")),
+        None => publish(&ctx, &repo, &opts).await,
+    };
+    match &result {
+        Ok(sha) => ctx.send("published", "push", format!("Зафиксировано {}", &sha[..8])),
+        Err(e) => ctx.send("error", "", e.to_string()),
+    }
+    result
+}
+
 pub async fn deploy<F: Fn(Event) + Send + Sync>(cfg: &Config, profile: &Profile, opts: DeployOptions, emit: &F) -> Result<Outcome> {
     let ctx = Ctx { profile, emit, progress: AtomicU8::new(0) };
     let repo = PathBuf::from(&profile.repo_path);
-    let result = deploy_inner(&ctx, cfg, &repo, &opts).await;
+    let started = std::time::Instant::now();
+    let mut result = deploy_inner(&ctx, cfg, &repo, &opts).await;
+    if let Ok(o) = result.as_mut() {
+        o.seconds = started.elapsed().as_secs();
+    }
     match &result {
         Ok(o) if o.ok => {
             ctx.progress.store(100, Ordering::Relaxed);
@@ -250,11 +271,11 @@ async fn deploy_inner<F: Fn(Event) + Send + Sync>(ctx: &Ctx<'_, F>, cfg: &Config
     if code != 0 {
         let (c, text) = error.unwrap_or((code, format!("Сервер вернул код {code}")));
         let text = if code == 255 { format!("SSH-соединение прервалось ({}). {text}", route.host) } else { text };
-        return Ok(Outcome { ok: false, sha, status: if result_status.is_empty() { "failed".into() } else { result_status }, text, code: c });
+        return Ok(Outcome { ok: false, sha, status: if result_status.is_empty() { "failed".into() } else { result_status }, text, code: c, seconds: 0 });
     }
 
     if opts.dry_run {
-        return Ok(Outcome { ok: true, sha: sha.clone(), status: "dry_run".into(), text: "Проверка пройдена, сервер не тронут".into(), code: 0 });
+        return Ok(Outcome { ok: true, sha: sha.clone(), status: "dry_run".into(), text: "Проверка пройдена, сервер не тронут".into(), code: 0, seconds: 0 });
     }
 
     ctx.step("finalize");
@@ -264,5 +285,5 @@ async fn deploy_inner<F: Fn(Event) + Send + Sync>(ctx: &Ctx<'_, F>, cfg: &Config
     if let Err(e) = git(repo, &["push", "-q", "--force", "origin", &prod, &tag]).await {
         ctx.send("warn", "", format!("Сервер обновлён, но отметить релиз в GitHub не удалось: {e}"));
     }
-    Ok(Outcome { ok: true, sha: sha.clone(), status: "success".into(), text: format!("Задеплоено {}", &sha[..8]), code: 0 })
+    Ok(Outcome { ok: true, sha: sha.clone(), status: "success".into(), text: format!("Задеплоено {}", &sha[..8]), code: 0, seconds: 0 })
 }

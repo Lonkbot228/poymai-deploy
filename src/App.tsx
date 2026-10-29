@@ -1,31 +1,65 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  api, ago, short,
-  type Config, type DeployEvent, type DeployOptions, type Outcome, type ProfileStatus,
-  type Release, type ServerStatus, type Snapshot,
-} from "./api";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { api, short, when, type DeployOptions, type Pending, type ProfileStatus, type Release, type ServerStatus, type Snapshot } from "./api";
+import { Composer, IncomingCard, PendingLine, RunCard, SyncLine, type Run } from "./components/deploy";
+import logo from "./assets/logo.png";
+import { IconCalendar, IconHistory, IconHome, IconRefresh, IconSettings } from "./components/icons";
+import { AnnounceSheet, GuardSheet } from "./components/modals";
+import { HistoryPage, SettingsPage } from "./components/pages";
+import { PlanPage, ScheduleSheet, type PresetId } from "./components/plan";
+import { StatusHero } from "./components/site";
+import { WindowControls } from "./components/window-controls";
 
-type Tab = "deploy" | "history" | "settings";
-type Run = { profile: string; progress: number; step: string; log: DeployEvent[]; outcome?: Outcome; error?: string };
+type Page = "overview" | "plan" | "history" | "settings";
+type ScheduleRequest = { options: DeployOptions; preset?: PresetId };
+
+const SUCCESS_CLOSE_MS = 5 * 60_000;
+
+const PAGES: { id: Page; label: string; icon: typeof IconHome }[] = [
+  { id: "overview", label: "Деплой", icon: IconHome },
+  { id: "plan", label: "План", icon: IconCalendar },
+  { id: "history", label: "История", icon: IconHistory },
+  { id: "settings", label: "", icon: IconSettings },
+];
+
+/** The project dot answers one question: is there anything to deploy or pull? */
+function changeState(st: ProfileStatus | undefined, deploying: boolean): { tone: string; hint: string } {
+  if (deploying) return { tone: "busy", hint: "Идёт деплой" };
+  if (!st) return { tone: "", hint: "Проверяю…" };
+  if (st.error) return { tone: "bad", hint: st.error };
+  const local = st.local;
+  if (local?.changes.length) return { tone: "warn", hint: `${local.changes.length} изменённых файлов` };
+  if (local?.ahead) return { tone: "warn", hint: `${local.ahead} коммитов не отправлено` };
+  if (st.incoming) return { tone: "warn", hint: `${st.incoming} новых коммитов на GitHub` };
+  if (st.github && st.production && st.github !== st.production) return { tone: "warn", hint: "На сервере не последняя версия" };
+  return { tone: "ok", hint: "Изменений нет" };
+}
 
 export default function App() {
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [active, setActive] = useState("main");
-  const [tab, setTab] = useState<Tab>("deploy");
+  const [page, setPage] = useState<Page>("overview");
   const [run, setRun] = useState<Run | null>(null);
   const [server, setServer] = useState<Record<string, ServerStatus | string>>({});
+  const [pending, setPending] = useState<Record<string, Pending | string>>({});
+  const [refreshing, setRefreshing] = useState(false);
+  const [schedule, setSchedule] = useState<ScheduleRequest | null>(null);
+  const [guard, setGuard] = useState<DeployOptions | null>(null);
+  const [announcing, setAnnouncing] = useState(false);
+  const [toast, setToast] = useState("");
 
   const load = useCallback(() => api.snapshot().then(setSnap), []);
+  const flash = useCallback((text: string) => { setToast(text); window.setTimeout(() => setToast(""), 3500); }, []);
   const loadServer = useCallback((id: string) => {
-    api.serverStatus(id)
-      .then((s) => setServer((m) => ({ ...m, [id]: s })))
-      .catch((e) => setServer((m) => ({ ...m, [id]: String(e) })));
+    api.serverStatus(id).then((s) => setServer((m) => ({ ...m, [id]: s }))).catch((e) => setServer((m) => ({ ...m, [id]: String(e) })));
+  }, []);
+  const loadPending = useCallback((id: string) => {
+    api.pending(id).then((p) => setPending((m) => ({ ...m, [id]: p }))).catch((e) => setPending((m) => ({ ...m, [id]: String(e) })));
   }, []);
 
   const startDeploy = useCallback(async (profile: string, options: DeployOptions) => {
     setActive(profile);
-    setTab("deploy");
-    setRun({ profile, progress: 0, step: "", log: [] });
+    setPage("overview");
+    setRun({ profile, progress: 0, step: "", log: [], started: Date.now() });
     try {
       const outcome = await api.deploy(profile, options);
       setRun((r) => r && { ...r, outcome, progress: outcome.ok ? 100 : r.progress });
@@ -34,336 +68,158 @@ export default function App() {
     }
     load();
     loadServer(profile);
-  }, [load, loadServer]);
+    loadPending(profile);
+  }, [load, loadServer, loadPending]);
 
   useEffect(() => {
     load();
     const subs = [
       api.onStatus(load),
+      api.onSite(() => load()),
       api.onDeployEvent((e) =>
         setRun((r) => {
-          if (!r || r.profile !== e.profile) return r;
+          // A scheduled deploy starts without a click: open its run card.
+          const base = r && r.profile === e.profile && !r.outcome && !r.error ? r : { profile: e.profile, progress: 0, step: "", log: [], started: Date.now() };
           return {
-            ...r,
-            progress: Math.max(r.progress, e.progress),
-            step: e.kind === "step" ? e.text : r.step,
-            log: [...r.log, e].slice(-800),
+            ...base,
+            progress: Math.max(base.progress, e.progress),
+            step: e.kind === "step" ? e.text : base.step,
+            log: [...base.log, e].slice(-800),
+            outcome: e.kind === "done" ? { ok: true, sha: "", status: "success", text: e.text, code: 0, seconds: Math.round((Date.now() - base.started) / 1000) } : base.outcome,
+            error: e.kind === "error" ? e.text : base.error,
           };
         }),
       ),
-      api.onTrayDeploy((p) => startDeploy(p, {})),
+      api.onTrayDeploy((p) => requestDeploy(p, {})),
+      api.onTrayQuiet((p) => { setActive(p); setSchedule({ options: {}, preset: "quiet" }); }),
     ];
     return () => subs.forEach((s) => s.then((un) => un()));
-  }, [load, startDeploy]);
+  }, [load]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // A success needs no attention: it closes itself after 5 minutes. Errors stay until closed.
+  const succeeded = run?.outcome?.ok && !run.error ? run.started : null;
+  useEffect(() => {
+    if (succeeded === null) return;
+    const timer = window.setTimeout(() => setRun((r) => (r && r.started === succeeded && r.outcome?.ok && !r.error ? null : r)), SUCCESS_CLOSE_MS);
+    return () => window.clearTimeout(timer);
+  }, [succeeded]);
 
   useEffect(() => {
-    if (snap) loadServer(active);
+    if (!snap) return;
+    loadServer(active);
+    loadPending(active);
+    if (!snap.site[active]?.data) void api.siteWindow(active).then(load).catch(() => {});
   }, [active, !!snap]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  if (!snap) return <div className="boot">Загрузка…</div>;
+  const site = snap?.site[active];
+  const profile = snap?.config.profiles.find((p) => p.id === active);
+  const hasSite = !!profile?.site_probe;
+  const activeJobs = useMemo(() => (snap?.jobs ?? []).filter((j) => ["waiting", "announced", "running"].includes(j.status)), [snap]);
+
+  function requestDeploy(profileId: string, options: DeployOptions) {
+    const level = snap?.site[profileId]?.data?.verdict.level;
+    if (snap?.config.guard_manual && !options.dry_run && !options.sha && level && level !== "ok") {
+      setActive(profileId);
+      setGuard(options);
+      return;
+    }
+    void startDeploy(profileId, options);
+  }
+
+  const refresh = async () => {
+    setRefreshing(true);
+    api.refresh(active);
+    loadServer(active);
+    loadPending(active);
+    try { if (hasSite) await api.siteWindow(active, true); } catch { /* shown in the hero */ }
+    await load();
+    setRefreshing(false);
+  };
+
+  if (!snap || !profile) return <div className="boot" data-tauri-drag-region><img className="logo" src={logo} alt="PoymAI" draggable={false} /></div>;
+
   const status = snap.statuses.find((s) => s.id === active);
-  const profile = snap.config.profiles.find((p) => p.id === active)!;
   const busy = snap.busy !== null || (run !== null && !run.outcome && !run.error);
+  const names = Object.fromEntries(snap.config.profiles.map((p) => [p.id, p.name]));
+  const srv = server[active];
+  const nextJob = activeJobs.find((j) => j.profile === active);
 
   return (
     <div className="app">
-      <header>
-        <div className="brand">
-          <span className="logo" />
-          <div>
-            <h1>Poymai Deploy</h1>
-            <small>{snap.machine}</small>
-          </div>
+      <header className="top" data-tauri-drag-region>
+        <img className="logo" src={logo} alt="PoymAI" draggable={false} data-tauri-drag-region />
+        <div className="projects" data-tauri-drag-region>
+          {snap.config.profiles.map((p) => {
+            const { tone, hint } = changeState(snap.statuses.find((s) => s.id === p.id), snap.busy === p.id);
+            return <button key={p.id} className={p.id === active ? "on" : ""} onClick={() => setActive(p.id)} title={hint}><span className={`dot ${tone}`} />{p.name}</button>;
+          })}
         </div>
-        <button className="ghost" title="Обновить" onClick={() => { api.refresh(); loadServer(active); }}>⟳</button>
+        <button className="icon-btn" onClick={refresh} title="Обновить"><IconRefresh size={14} className={refreshing ? "spin" : ""} /></button>
+        <span className="top-sep" data-tauri-drag-region />
+        <WindowControls />
       </header>
 
-      <nav className="profiles">
-        {snap.config.profiles.map((p) => {
-          const st = snap.statuses.find((s) => s.id === p.id);
-          return (
-            <button key={p.id} className={p.id === active ? "on" : ""} onClick={() => setActive(p.id)}>
-              <Dot tone={tone(st)} /> {p.name}
-            </button>
-          );
-        })}
-      </nav>
-
       <nav className="tabs">
-        {([["deploy", "Деплой"], ["history", "История"], ["settings", "Настройки"]] as [Tab, string][]).map(([id, label]) => (
-          <button key={id} className={tab === id ? "on" : ""} onClick={() => setTab(id)}>{label}</button>
+        {PAGES.map((p) => (
+          <button key={p.id} className={`${page === p.id ? "on" : ""}${p.label ? "" : " icon-only"}`} onClick={() => setPage(p.id)} title={p.label || "Настройки"}>
+            <p.icon size={14} />{p.label}
+            {p.id === "plan" && activeJobs.length > 0 && <span className="count">{activeJobs.length}</span>}
+          </button>
         ))}
       </nav>
 
-      <main>
-        {tab === "deploy" && (
-          <>
-            <SyncCard status={status} server={server[active]} />
-            {status && status.incoming > 0 && <IncomingCard status={status} onDone={load} />}
-            {run && run.profile === active ? (
-              <RunCard run={run} steps={snap.steps} onClose={() => { setRun(null); api.dismissError(); }}
-                onRetry={(o) => startDeploy(active, o)} />
-            ) : (
-              <DeployCard status={status} busy={busy} onDeploy={(o) => startDeploy(active, o)} />
+      <main className="content">
+        {page === "overview" && (
+          <div className="stack">
+            {hasSite && <StatusHero state={site} onIdeal={() => setSchedule({ options: {}, preset: "best" })} />}
+            {nextJob && (
+              <button className="next-job" onClick={() => setPage("plan")}>
+                <IconCalendar size={14} /><span className="grow">Запланирован деплой {nextJob.announced_for ? when(nextJob.announced_for) : nextJob.mode === "at" ? when(nextJob.run_at) : "когда никого нет"}</span><code>{short(nextJob.sha)}</code>
+              </button>
             )}
-          </>
-        )}
-        {tab === "history" && (
-          <History profile={active} current={typeof server[active] === "object" ? (server[active] as ServerStatus).head : ""}
-            busy={busy} onRollback={(sha) => startDeploy(active, { sha })} />
-        )}
-        {tab === "settings" && <Settings config={snap.config} onSaved={load} repo={profile.repo_path} />}
-      </main>
-    </div>
-  );
-}
-
-function tone(st?: ProfileStatus): "ok" | "warn" | "bad" | "idle" {
-  if (!st) return "idle";
-  if (st.error) return "bad";
-  if (st.incoming > 0) return "warn";
-  if (st.local && (st.local.changes.length > 0 || st.local.head !== st.production)) return "warn";
-  return "ok";
-}
-
-function Dot({ tone }: { tone: string }) {
-  return <span className={`dot ${tone}`} />;
-}
-
-function SyncCard({ status, server }: { status?: ProfileStatus; server?: ServerStatus | string }) {
-  if (!status) return <section className="card">Проверяю…</section>;
-  const local = status.local;
-  const srv = typeof server === "object" ? server : null;
-  const serverSha = srv?.head || status.production;
-  const nodes = [
-    { label: "Этот компьютер", sha: local?.head, sub: local ? (local.changes.length ? `${local.changes.length} изм. файлов` : "чисто") : "—", ok: !!local && local.changes.length === 0 && local.head === status.github },
-    { label: "GitHub", sha: status.github, sub: "main", ok: !!status.github && status.github === serverSha },
-    { label: "Сервер", sha: serverSha, sub: srv ? srv.route : typeof server === "string" ? "нет связи" : "…", ok: !!serverSha && serverSha === status.github && (srv?.drift ?? 0) === 0 },
-  ];
-  let summary = "Всё синхронизировано";
-  let summaryTone = "ok";
-  if (status.error) { summary = status.error; summaryTone = "bad"; }
-  else if (status.incoming > 0) { summary = `На GitHub ${status.incoming} новых коммитов с другого компьютера`; summaryTone = "warn"; }
-  else if (local && local.changes.length > 0) { summary = "Есть незакоммиченные изменения"; summaryTone = "warn"; }
-  else if (local && local.ahead > 0) { summary = `${local.ahead} коммитов не отправлено в GitHub`; summaryTone = "warn"; }
-  else if (status.github && serverSha && status.github !== serverSha) { summary = "На сервере не последняя версия из GitHub"; summaryTone = "warn"; }
-  if (srv && srv.drift > 0) { summary = `На сервере ${srv.drift} файлов изменено вручную`; summaryTone = "bad"; }
-  if (srv?.busy) { summary = `Идёт деплой: ${srv.busy}`; summaryTone = "warn"; }
-
-  return (
-    <section className="card">
-      <div className="chain">
-        {nodes.map((n, i) => (
-          <div key={n.label} className="chain-item">
-            <div className={`node ${n.ok ? "ok" : "warn"}`}>
-              <span className="node-label">{n.label}</span>
-              <code>{short(n.sha)}</code>
-              <span className="node-sub">{n.sub}</span>
-            </div>
-            {i < nodes.length - 1 && <span className="link" />}
+            {run && run.profile === active
+              ? <RunCard run={run} onClose={() => { setRun(null); api.dismissError(); }} onRetry={(o) => startDeploy(active, o)} />
+              : <Composer status={status} busy={busy} onDeploy={(o) => requestDeploy(active, o)} onSchedule={(o) => setSchedule({ options: o })} />}
+            <SyncLine status={status} server={srv} />
+            {status && status.incoming > 0 && <IncomingCard status={status} onDone={load} />}
+            <PendingLine pending={typeof pending[active] === "object" ? pending[active] as Pending : undefined} error={typeof pending[active] === "string" ? pending[active] as string : undefined} />
           </div>
-        ))}
-      </div>
-      <p className={`summary ${summaryTone}`}>{summary}</p>
-      {srv?.current && (
-        <p className="muted">
-          На сервере: «{srv.current.message}» · {srv.current.actor} · {srv.current.machine} · {ago(srv.current.finished)}
-        </p>
-      )}
-      <p className="muted tiny">Проверено в {status.checked_at}</p>
-    </section>
-  );
-}
-
-function IncomingCard({ status, onDone }: { status: ProfileStatus; onDone: () => void }) {
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState("");
-  return (
-    <section className="card accent">
-      <h3>Обновления с другого компьютера</h3>
-      {status.overlap.length > 0 ? (
-        <p className="bad">Эти файлы изменены и у вас, и в обновлении — разрулите вручную: {status.overlap.join(", ")}</p>
-      ) : (
-        <p className="muted">Ваши локальные правки будут сохранены и возвращены после обновления.</p>
-      )}
-      <button disabled={busy || status.overlap.length > 0} onClick={async () => {
-        setBusy(true);
-        try { setMsg(await api.pullUpdates(status.id)); } catch (e) { setMsg(String(e)); }
-        setBusy(false);
-        onDone();
-      }}>{busy ? "Обновляю…" : `Получить ${status.incoming} коммит(ов)`}</button>
-      {msg && <p className="muted pre">{msg}</p>}
-    </section>
-  );
-}
-
-function DeployCard({ status, busy, onDeploy }: { status?: ProfileStatus; busy: boolean; onDeploy: (o: DeployOptions) => void }) {
-  const [message, setMessage] = useState("");
-  const [dry, setDry] = useState(false);
-  const [backup, setBackup] = useState(false);
-  const [showFiles, setShowFiles] = useState(false);
-  const changes = status?.local?.changes ?? [];
-  const suggested = status?.local?.suggested_message ?? "";
-  // Local changes are committed only with a message the user has seen.
-  const needsMessage = changes.length > 0 && !message.trim();
-  const blocked = !status?.local || status.incoming > 0 && status.overlap.length > 0;
-  return (
-    <section className="card">
-      <div className="row between">
-        <h3>Новый деплой</h3>
-        {changes.length > 0 && (
-          <button className="link-btn" onClick={() => setShowFiles(!showFiles)}>
-            {changes.length} файлов {showFiles ? "▴" : "▾"}
-          </button>
         )}
-      </div>
-      {showFiles && (
-        <ul className="files">
-          {changes.map((f) => (
-            <li key={f.path}><span className={`fs fs-${f.status.replace("?", "A")[0]}`}>{f.status === "??" ? "A" : f.status}</span>{f.path}</li>
-          ))}
-        </ul>
-      )}
-      <textarea
-        placeholder={changes.length ? "Что изменилось?" : "Нет новых изменений — будет передеплоен текущий коммит"}
-        value={message}
-        onChange={(e) => setMessage(e.target.value)}
-        rows={2}
-      />
-      {needsMessage && suggested && (
-        <p className="muted tiny">
-          Предлагаемое сообщение: «{suggested}»{" "}
-          <button className="link-btn" onClick={() => setMessage(suggested)}>Подставить</button>
-        </p>
-      )}
-      <div className="row opts">
-        <label><input type="checkbox" checked={dry} onChange={(e) => setDry(e.target.checked)} /> Только проверить</label>
-        <label><input type="checkbox" checked={backup} onChange={(e) => setBackup(e.target.checked)} /> Бэкап БД</label>
-      </div>
-      <button className="primary" disabled={busy || blocked || needsMessage}
-        onClick={() => onDeploy({ message, dry_run: dry, backup_db: backup })}>
-        {busy ? "Деплой идёт…" : dry ? "Проверить" : "Задеплоить"}
-      </button>
-      <p className="muted tiny">Коммит → GitHub → сервер ставит этот коммит → проверка здоровья → при ошибке автоматический откат.</p>
-    </section>
-  );
-}
-
-function RunCard({ run, steps, onClose, onRetry }: {
-  run: Run; steps: [string, number, string][]; onClose: () => void; onRetry: (o: DeployOptions) => void;
-}) {
-  const logRef = useRef<HTMLDivElement>(null);
-  useEffect(() => { logRef.current?.scrollTo(0, logRef.current.scrollHeight); }, [run.log.length]);
-  const done = run.outcome?.ok;
-  const failed = run.error || (run.outcome && !run.outcome.ok);
-  const errText = run.error || (!run.outcome?.ok ? run.outcome?.text : "");
-  const seen = new Set(run.log.filter((e) => e.kind === "step").map((e) => e.step));
-  const current = [...run.log].reverse().find((e) => e.kind === "step")?.step;
-  const visible = steps.filter(([id]) => seen.has(id));
-  const logText = run.log.map((e) => (e.kind === "step" ? `==> ${e.text}` : e.text)).join("\n");
-
-  return (
-    <section className={`card run ${done ? "ok" : failed ? "bad" : ""}`}>
-      <div className="row between">
-        <h3>{done ? "Готово" : failed ? "Ошибка" : run.step || "Запуск…"}</h3>
-        <span className="pct">{run.progress}%</span>
-      </div>
-      <div className="bar"><span style={{ width: `${run.progress}%` }} /></div>
-      <ol className="steps">
-        {visible.map(([id, , label]) => (
-          <li key={id} className={id === current && !done ? (failed ? "bad" : "now") : "past"}>{label}</li>
-        ))}
-      </ol>
-      {errText && <p className="bad pre">{errText}</p>}
-      {done && <p className="ok">{run.outcome!.text}</p>}
-      <div className="log" ref={logRef}>
-        {run.log.filter((e) => e.kind !== "step").map((e, i) => (
-          <div key={i} className={`l-${e.kind}`}>{e.text}</div>
-        ))}
-      </div>
-      <div className="row gap">
-        {(done || failed) && <button onClick={onClose}>Закрыть</button>}
-        <button className="ghost" onClick={() => navigator.clipboard.writeText(logText + (errText ? `\n\n${errText}` : ""))}>Копировать лог</button>
-        {run.outcome?.code === 20 && (
-          <button className="danger" onClick={() => onRetry({ accept_drift: true, sha: run.outcome!.sha })}>
-            Перезаписать правки на сервере
-          </button>
+        {page === "plan" && (
+          <PlanPage site={site} hasSite={hasSite} jobs={snap.jobs} names={names} busy={busy} announce={snap.config.announce_minutes}
+            onPick={(preset) => setSchedule({ options: {}, preset })}
+            onBanner={() => setAnnouncing(true)}
+            onClearBanner={async () => { try { await api.clearNotice(active); flash("Баннер убран"); } catch (e) { flash(String(e)); } load(); }} />
         )}
-      </div>
-    </section>
-  );
-}
+        {page === "history" && (
+          <HistoryPage profile={active} current={typeof srv === "object" ? srv.head : ""} busy={busy}
+            onRollback={(r: Release) => { if (confirm(`Откатить сервер на ${short(r.sha)} «${r.message}»?`)) void startDeploy(active, { sha: r.sha }); }} />
+        )}
+        {page === "settings" && (
+          <SettingsPage config={snap.config} onSaved={load} onTestSite={async (id) => {
+            try {
+              const s = await api.siteWindow(id, true);
+              await load();
+              return s.data ? `Есть связь: «${s.data.verdict.title}»` : s.error || "Нет ответа";
+            } catch (e) { return String(e); }
+          }} />
+        )}
+      </main>
 
-function History({ profile, current, busy, onRollback }: { profile: string; current: string; busy: boolean; onRollback: (sha: string) => void }) {
-  const [list, setList] = useState<Release[] | null>(null);
-  const [err, setErr] = useState("");
-  useEffect(() => {
-    setList(null);
-    api.releases(profile).then(setList).catch((e) => setErr(String(e)));
-  }, [profile]);
-  if (err) return <section className="card bad">{err}</section>;
-  if (!list) return <section className="card">Загружаю историю с сервера…</section>;
-  if (!list.length) return <section className="card muted">Релизов пока нет — история появится после первого деплоя через приложение.</section>;
-  const label: Record<string, string> = {
-    success: "успех", rolled_back: "откат", build_failed: "сборка упала", failed: "ошибка",
-    rollback_failed: "откат не удался", dry_run: "проверка",
-  };
-  return (
-    <section className="card">
-      <ul className="releases">
-        {list.map((r, i) => (
-          <li key={i} className={r.sha === current ? "current" : ""}>
-            <div className="row between">
-              <span><span className={`badge s-${r.status}`}>{label[r.status] ?? r.status}</span> <code>{short(r.sha)}</code></span>
-              <span className="muted tiny">{ago(r.finished)}</span>
-            </div>
-            <div className="msg">{r.message}</div>
-            <div className="row between">
-              <span className="muted tiny">{r.actor} · {r.machine}</span>
-              {r.status === "success" && r.sha !== current && (
-                <button className="link-btn" disabled={busy}
-                  onClick={() => confirm(`Откатить сервер на ${short(r.sha)} «${r.message}»?`) && onRollback(r.sha)}>
-                  Откатить сюда
-                </button>
-              )}
-              {r.sha === current && <span className="tiny ok">сейчас на сервере</span>}
-            </div>
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-function Settings({ config, onSaved, repo }: { config: Config; onSaved: () => void; repo: string }) {
-  const [draft, setDraft] = useState<Config>(config);
-  const [saved, setSaved] = useState("");
-  const setProfile = (i: number, patch: Partial<Config["profiles"][number]>) =>
-    setDraft({ ...draft, profiles: draft.profiles.map((p, j) => (i === j ? { ...p, ...patch } : p)) });
-  return (
-    <section className="card settings">
-      {draft.profiles.map((p, i) => (
-        <fieldset key={p.id}>
-          <legend>{p.name}</legend>
-          <label>Папка проекта на этом компьютере<input value={p.repo_path} onChange={(e) => setProfile(i, { repo_path: e.target.value })} /></label>
-          <label>Папка на сервере<input value={p.remote_dir} onChange={(e) => setProfile(i, { remote_dir: e.target.value })} /></label>
-          <label>Проверки перед коммитом (по строке)
-            <textarea rows={2} value={p.checks.join("\n")} placeholder="например: npm --prefix frontend run lint"
-              onChange={(e) => setProfile(i, { checks: e.target.value.split("\n").filter((l) => l.trim()) })} />
-          </label>
-          <label className="check"><input type="checkbox" checked={p.auto_pull} onChange={(e) => setProfile(i, { auto_pull: e.target.checked })} /> Автоматически подтягивать изменения с GitHub</label>
-          <p className="muted tiny">Сервер: {p.routes.map((r) => `${r.name}: ${r.user}@${r.host}${r.jump ? ` через ${r.jump}` : ""}`).join(" → ")}</p>
-        </fieldset>
-      ))}
-      <label>SSH-ключ<input value={draft.ssh_key} onChange={(e) => setDraft({ ...draft, ssh_key: e.target.value })} /></label>
-      <label>Проверять GitHub каждые, сек<input type="number" min={15} value={draft.poll_seconds}
-        onChange={(e) => setDraft({ ...draft, poll_seconds: Number(e.target.value) })} /></label>
-      <div className="row gap">
-        <button className="primary" onClick={async () => { await api.saveConfig(draft); setSaved("Сохранено"); onSaved(); }}>Сохранить</button>
-        <button className="ghost" onClick={() => api.openPath(repo)}>Открыть папку проекта</button>
-      </div>
-      {saved && <p className="ok">{saved}</p>}
-      <p className="muted tiny">Настройки этого компьютера: ~/.poymai-deploy/config.json</p>
-    </section>
+      {schedule && (
+        <ScheduleSheet profile={active} name={profile.name} site={site?.data} initial={schedule.options} preset={schedule.preset}
+          announce={snap.config.announce_minutes} onClose={() => setSchedule(null)}
+          onDone={(t) => { setSchedule(null); flash(t); setPage("plan"); load(); loadPending(active); }} />
+      )}
+      {guard && site?.data && (
+        <GuardSheet site={site.data} onCancel={() => setGuard(null)}
+          onNow={() => { const o = guard; setGuard(null); void startDeploy(active, o); }}
+          onBest={() => { const o = guard; setGuard(null); setSchedule({ options: o, preset: "best" }); }}
+          onQuiet={() => { const o = guard; setGuard(null); setSchedule({ options: o, preset: "quiet" }); }}
+          onSoon={() => { const o = guard; setGuard(null); setSchedule({ options: o, preset: "soon" }); }} />
+      )}
+      {announcing && <AnnounceSheet profile={active} onClose={() => setAnnouncing(false)} onDone={(t) => { setAnnouncing(false); flash(t); load(); }} />}
+      {toast && <div className="toast">{toast}</div>}
+    </div>
   );
 }

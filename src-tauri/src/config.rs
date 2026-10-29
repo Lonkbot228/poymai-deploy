@@ -35,7 +35,13 @@ pub struct Profile {
     pub checks: Vec<String>,
     #[serde(default = "yes")]
     pub auto_pull: bool,
+    /// Remote command (run in `remote_dir`) that prints the site's deploy-window JSON.
+    /// `None` = not set yet (filled with the default for PoymAI), "" = switched off.
+    #[serde(default)]
+    pub site_probe: Option<String>,
 }
+
+pub const POYMAI_PROBE: &str = "if docker compose version >/dev/null 2>&1; then c='docker compose'; else c=docker-compose; fi; $c exec -T backend python3 -m app.deploy_window";
 
 fn default_branch() -> String {
     "main".into()
@@ -52,6 +58,22 @@ pub struct Config {
     /// Private key for the servers; empty = ssh defaults / agent.
     #[serde(default)]
     pub ssh_key: String,
+    /// Before a scheduled deploy, show "Обновление через N мин" in the dashboard (0 = never).
+    #[serde(default = "default_announce")]
+    pub announce_minutes: u32,
+    /// Ask before a manual deploy when the site says people would be interrupted.
+    #[serde(default = "yes")]
+    pub guard_manual: bool,
+    /// How often the site is asked about a deploy window, seconds.
+    #[serde(default = "default_site_poll")]
+    pub site_poll_seconds: u64,
+}
+
+fn default_announce() -> u32 {
+    5
+}
+fn default_site_poll() -> u64 {
+    120
 }
 
 fn default_poll() -> u64 {
@@ -97,6 +119,9 @@ impl Default for Config {
         };
         Config {
             poll_seconds: 60,
+            announce_minutes: default_announce(),
+            guard_manual: true,
+            site_poll_seconds: default_site_poll(),
             ssh_key: key.to_string_lossy().into_owned(),
             profiles: vec![
                 Profile {
@@ -108,6 +133,7 @@ impl Default for Config {
                     routes: vec![main_lan, main_wan],
                     checks: vec![],
                     auto_pull: true,
+                    site_probe: Some(POYMAI_PROBE.into()),
                 },
                 Profile {
                     id: "telegram".into(),
@@ -133,6 +159,7 @@ impl Default for Config {
                     ],
                     checks: vec![],
                     auto_pull: true,
+                    site_probe: Some(String::new()),
                 },
             ],
         }
@@ -141,7 +168,14 @@ impl Default for Config {
 
 pub fn load() -> Config {
     match std::fs::read_to_string(config_path()) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+        Ok(text) => {
+            let mut cfg: Config = serde_json::from_str(&text).unwrap_or_default();
+            // Configs written before the site link existed: PoymAI gets the probe.
+            for p in cfg.profiles.iter_mut().filter(|p| p.site_probe.is_none()) {
+                p.site_probe = Some(if p.id == "main" { POYMAI_PROBE.into() } else { String::new() });
+            }
+            cfg
+        }
         Err(_) => {
             let cfg = Config::default();
             let _ = save(&cfg);

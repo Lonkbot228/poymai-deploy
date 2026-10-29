@@ -3,7 +3,7 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("deploy") {
+    if matches!(args.get(1).map(String::as_str), Some("deploy" | "window")) {
         #[cfg(windows)]
         unsafe {
             // Reuse the terminal we were started from so CLI output is visible.

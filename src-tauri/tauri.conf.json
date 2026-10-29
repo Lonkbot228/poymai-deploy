@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Poymai Deploy",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "identifier": "ru.poymai.deploy",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -14,11 +14,13 @@
       {
         "label": "main",
         "title": "Poymai Deploy",
-        "width": 460,
-        "height": 720,
+        "width": 480,
+        "height": 700,
         "minWidth": 400,
-        "minHeight": 560,
+        "minHeight": 520,
         "visible": false,
+        "decorations": false,
+        "shadow": true,
         "resizable": true
       }
     ],
