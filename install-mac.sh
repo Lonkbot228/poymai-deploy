@@ -63,15 +63,20 @@ install_key() { # install_key <label> <ssh args...>
     < "$KEY.pub" && can_login "$@"
 }
 
+# A VPN away from home can accept TCP for a LAN address and reset it, so wait
+# for the real "SSH-" banner instead of trusting an open port.
+ssh_alive() { python3 -I -c 'import socket,sys
+s=socket.create_connection((sys.argv[1],22),3); s.settimeout(3); sys.exit(s.recv(4)!=b"SSH-")' "$1" 2>/dev/null; }
+
 MAIN_OK=0
 for target in "$MAIN_LAN" "$MAIN_WAN"; do
-  if nc -z -G 3 "${target#*@}" 22 2>/dev/null; then
+  if ssh_alive "${target#*@}"; then
     install_key "PoymAI ($target)" "$target" && { MAIN_OK=1; break; }
   fi
 done
 [[ $MAIN_OK == 1 ]] || die "Не удалось подключиться к серверу PoymAI. Подключитесь к домашней сети/интернету и запустите скрипт снова."
 
-if nc -z -G 3 192.168.3.99 22 2>/dev/null; then
+if ssh_alive 192.168.3.99; then
   install_key "Telegram-шлюз (LAN)" "$TG_LAN" || echo "    ! шлюз пропущен — повторите позже"
 else
   install_key "Telegram-шлюз (через PoymAI)" -J "$MAIN_WAN" "$TG_LAN" || echo "    ! шлюз пропущен — повторите позже"

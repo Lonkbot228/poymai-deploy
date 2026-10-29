@@ -8,11 +8,19 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::process::Command;
 
+/// True only when a real SSH server answers: a VPN or proxy (e.g. a utun
+/// interface away from home) can accept the TCP connect for a LAN address and
+/// then reset it, so an open port alone is not enough.
 fn reachable(host: &str, port: u16, timeout: Duration) -> bool {
     let Ok(addrs) = (host, port).to_socket_addrs() else { return false };
-    addrs
-        .into_iter()
-        .any(|addr| std::net::TcpStream::connect_timeout(&addr, timeout).is_ok())
+    addrs.into_iter().any(|addr| {
+        let Ok(mut stream) = std::net::TcpStream::connect_timeout(&addr, timeout) else { return false };
+        if stream.set_read_timeout(Some(timeout)).is_err() {
+            return false;
+        }
+        let mut banner = [0u8; 4];
+        std::io::Read::read_exact(&mut stream, &mut banner).is_ok() && &banner == b"SSH-"
+    })
 }
 
 fn split_jump(jump: &str) -> (String, u16) {
