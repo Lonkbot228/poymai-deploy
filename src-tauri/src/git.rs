@@ -61,6 +61,69 @@ pub async fn local_state(repo: &Path, branch: &str) -> Result<LocalState> {
     })
 }
 
+/// Where the previous HEAD is kept when GitHub history was rewritten under it.
+pub const BEFORE_REWRITE_REF: &str = "refs/poymai-deploy/before-rewrite";
+
+/// How HEAD got onto `origin/<branch>`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Rebased {
+    /// Histories are related: a plain `git rebase`.
+    Plain,
+    /// GitHub history was rewritten (force-push), so HEAD and upstream share no commit.
+    /// `upstream_twin` is the GitHub commit holding exactly the tree of the newest local
+    /// commit that was already there; only local commits after it were replayed.
+    Rewritten { replayed: u32, upstream_twin: String },
+}
+
+/// Newest local commit whose tree some upstream commit also has, and that upstream
+/// commit (the newest one with it). Both inputs are `git log --format='%H %T'` output,
+/// newest first.
+fn newest_shared_tree(local_log: &str, upstream_log: &str) -> Option<(String, String)> {
+    let mut by_tree = std::collections::HashMap::new();
+    for line in upstream_log.lines() {
+        if let Some((hash, tree)) = line.split_once(' ') {
+            by_tree.entry(tree).or_insert(hash);
+        }
+    }
+    local_log.lines().find_map(|line| {
+        let (hash, tree) = line.split_once(' ')?;
+        by_tree.get(tree).map(|twin| (hash.to_string(), twin.to_string()))
+    })
+}
+
+/// Puts HEAD on top of `upstream`. Also copes with a force-pushed upstream, where a plain
+/// rebase would replay the whole history from the first commit and conflict everywhere.
+/// On failure the rebase is aborted and the git output is returned as the error.
+pub async fn rebase_onto_upstream(repo: &Path, upstream: &str) -> Result<Rebased> {
+    let related = git(repo, &["merge-base", "HEAD", upstream]).await.is_ok();
+    let (args, rebased) = if related {
+        (vec!["rebase", "-q", upstream].into_iter().map(String::from).collect::<Vec<_>>(), Rebased::Plain)
+    } else {
+        let local_log = git(repo, &["log", "--format=%H %T", "HEAD"]).await?;
+        let upstream_log = git(repo, &["log", "--format=%H %T", upstream]).await?;
+        let Some((local_base, upstream_twin)) = newest_shared_tree(&local_log, &upstream_log) else {
+            bail!(
+                "История {upstream} переписана и не имеет общих снимков с локальной веткой — \
+                 перенесите свои коммиты вручную (git rebase --onto)."
+            );
+        };
+        let replayed: u32 = git(repo, &["rev-list", "--count", &format!("{local_base}..HEAD")])
+            .await?
+            .parse()
+            .unwrap_or(0);
+        git(repo, &["update-ref", BEFORE_REWRITE_REF, "HEAD"]).await?;
+        let args = ["rebase", "-q", "--onto", upstream, &local_base].map(String::from).to_vec();
+        (args, Rebased::Rewritten { replayed, upstream_twin })
+    };
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = run("git", &args, Some(repo)).await?;
+    if !out.ok() {
+        let _ = run("git", &["rebase", "--abort"], Some(repo)).await;
+        bail!("{}", out.text());
+    }
+    Ok(rebased)
+}
+
 pub async fn changes(repo: &Path) -> Result<Vec<ChangedFile>> {
     // `run`, not `git`/`run_ok`: those trim stdout, and the first entry of
     // " M app/x.py" starts with a space that belongs to the status column.
@@ -198,6 +261,19 @@ mod tests {
         assert_eq!(files[0].path, ".env");
         let err = check_secrets(Path::new("/nonexistent"), &files).unwrap_err().to_string();
         assert!(err.contains("секрет: .env"), "{err}");
+    }
+
+    #[test]
+    fn rewritten_history_is_matched_by_tree() {
+        // Local: L3 (new work) on top of L2, whose tree GitHub has as U2 after a rewrite.
+        let local = "L3 t3\nL2 t2\nL1 t1\n";
+        let upstream = "U4 t4\nU2b t2\nU2 t2\nU1 t1\n";
+        assert_eq!(newest_shared_tree(local, upstream), Some(("L2".into(), "U2b".into())));
+    }
+
+    #[test]
+    fn nothing_shared_means_no_base() {
+        assert_eq!(newest_shared_tree("L1 a\n", "U1 b\n"), None);
     }
 
     #[test]

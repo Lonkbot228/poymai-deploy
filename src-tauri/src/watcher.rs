@@ -156,24 +156,42 @@ pub async fn pull_with_local_changes(profile: &Profile) -> Result<String> {
         git(&repo, &["stash", "push", "-u", "-q", "-m", "poymai-deploy: auto-stash before update"]).await?;
     }
     let pulled = if local.ahead > 0 {
-        git(&repo, &["rebase", "-q", &upstream]).await
+        git::rebase_onto_upstream(&repo, &upstream).await
     } else {
-        git(&repo, &["merge", "-q", "--ff-only", &upstream]).await
+        git(&repo, &["merge", "-q", "--ff-only", &upstream]).await.map(|_| git::Rebased::Plain)
     };
-    if let Err(e) = pulled {
-        let _ = git(&repo, &["rebase", "--abort"]).await;
-        if stashed {
-            let _ = git(&repo, &["stash", "pop", "-q"]).await;
+    let pulled = match pulled {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = git(&repo, &["rebase", "--abort"]).await;
+            if stashed {
+                let _ = git(&repo, &["stash", "pop", "-q"]).await;
+            }
+            bail!("Не удалось обновиться, всё возвращено как было: {e}");
         }
-        bail!("Не удалось обновиться, всё возвращено как было: {e}");
-    }
+    };
     if stashed {
         if let Err(e) = git(&repo, &["stash", "pop", "-q"]).await {
             bail!("Обновление получено, но ваши правки не вернулись автоматически — они в `git stash list`: {e}");
         }
     }
     let changed = git(&repo, &["diff", "--name-only", &before, "HEAD"]).await.unwrap_or_default();
-    let mut text = describe_incoming(&repo, &before, "HEAD").await;
+    let mut text = match pulled {
+        // `before..HEAD` would list the whole rewritten history; count from the twin instead.
+        git::Rebased::Rewritten { replayed, upstream_twin } => {
+            let incoming = describe_incoming(&repo, &upstream_twin, &upstream).await;
+            let mut t = String::from("История на GitHub была переписана — ветка переведена на неё");
+            if replayed > 0 {
+                t.push_str(&format!(", ваших коммитов перенесено: {replayed}"));
+            }
+            if !incoming.is_empty() {
+                t.push_str(&format!(". Новое: {incoming}"));
+            }
+            t.push_str(&format!(". Прежняя вершина сохранена в {}", git::BEFORE_REWRITE_REF));
+            t
+        }
+        git::Rebased::Plain => describe_incoming(&repo, &before, "HEAD").await,
+    };
     if let Some(hint) = lockfile_hint(&changed) {
         text.push_str(". ");
         text.push_str(&hint);

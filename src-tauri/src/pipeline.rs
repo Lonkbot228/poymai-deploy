@@ -167,10 +167,15 @@ async fn publish<F: Fn(Event) + Send + Sync>(ctx: &Ctx<'_, F>, repo: &Path, opts
         let behind: u32 = git(repo, &["rev-list", "--count", &format!("HEAD..{upstream}")]).await?.parse().unwrap_or(0);
         if behind > 0 {
             ctx.log(format!("На GitHub {behind} новых коммитов с другого компьютера — перебазирую"));
-            let out = run("git", &["rebase", "-q", &upstream], Some(repo)).await?;
-            if !out.ok() {
-                let _ = run("git", &["rebase", "--abort"], Some(repo)).await;
-                bail!("Конфликт с изменениями с другого компьютера. Сделайте `git pull --rebase` и решите конфликт вручную.\n{}", out.text());
+            match git::rebase_onto_upstream(repo, &upstream).await {
+                Ok(git::Rebased::Plain) => {}
+                Ok(git::Rebased::Rewritten { replayed, .. }) => ctx.log(format!(
+                    "История на GitHub была переписана — перенесено своих коммитов: {replayed}; прежняя вершина в {}",
+                    git::BEFORE_REWRITE_REF
+                )),
+                Err(e) => bail!(
+                    "Конфликт с изменениями с другого компьютера. Сделайте `git pull --rebase` и решите конфликт вручную.\n{e}"
+                ),
             }
         }
         let out = run("git", &["push", "-q", "origin", &refspec], Some(repo)).await?;
